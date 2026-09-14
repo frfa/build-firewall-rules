@@ -1,4 +1,5 @@
 #!/bin/sh
+# $Id$
 program="${0##*/}"
 
 # H1 `build-firewall-rules` - create iptables IPv4 and IPv6 rules from template
@@ -34,7 +35,7 @@ exe() { [ "$n" ] && msg "$*" || { dbg "$*"; "$@"; }; } # executions except -n
 # helpers
 expl() { perl -e "print $*"; }
 contains() { expr "$1" : ".*[$2]" >/dev/null; }
-# predicates für Chains ^[A-Z], Interfaces ^[a-z] und Options ^-
+# predicates forr Chains ^[A-Z], Interfaces ^[a-z] and Options ^-
 ischain() { expr "$1" : '^[A-Z]' >/dev/null; }
 isif() { expr "$1" : '^[a-z]' >/dev/null; }
 isopt() { expr "$1" : '^-' >/dev/null; }
@@ -612,7 +613,7 @@ if iptables-restore --test < "$V4_OUT" && ip6tables-restore --test < "$V6_OUT"; 
     if [ "$n" ]; then
         inf "[SUCCESS] Syntax test passed! (Dry-run: No files have been changed)."
     else
-        inf "[SUCCESS] $V4_OUT und $V6_OUT generated and validated."
+        inf "[SUCCESS] $V4_OUT and $V6_OUT generated and validated."
         [ "$l" ] && {
             ntc "[LIVE] Activating IPv4 rules $V4_OUT now!"
             iptables-restore <"$V4_OUT" || err "Error activating IPv4 rules!"

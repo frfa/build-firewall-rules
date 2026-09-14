@@ -85,10 +85,12 @@ N [LIVE] Activating IPv6 rules /etc/iptables/rules.v6 now!
 > Debian-based OSes), which creates a one-shot systemd job that loads
 > those rules at startup.
 
+---
+
 ## 🗒️ Examples and `ipset`
 
 You may find a detailed example for a dual-homed firewall setup with droplists,
-Geo-IP-based routing, and Wireguard VPN rules in <examples/rules.template>.
+Geo-IP-based routing, and Wireguard VPN rules in [examples/rules.template](examples/rules.template).
 
 ⚠️ Note that in order to make this example functional you need `ipset` to be
 installed, as the example uses droplists from <spamhaus.org> and GeoIP-based

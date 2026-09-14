@@ -1,4 +1,5 @@
 # -*- sh -*-
+# $Id$
 # =========================================================
 # /etc/iptables/rules.template
 # This is an example for a dual-homed firewall configuration with Spamhaus drop
