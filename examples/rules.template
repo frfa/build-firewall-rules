@@ -1,0 +1,127 @@
+# -*- sh -*-
+# =========================================================
+# /etc/iptables/rules.template
+# This is an example for a dual-homed firewall configuration with Spamhaus drop
+# lists, Geo-IP based routing, and a Wireguard VPN.
+# Generate rulesets with ./build-firewall-rules -v [-n for dry-run]
+# Set live with ./build-firewall-rules -v -l
+# Or set live with iptables-restore </etc/iptables/rules.v4 or rules.v6 resp.
+# =========================================================
+EXT_IF="eth1"
+INT_IF="eth0"
+VPN_IF="wg0"
+
+# Intranet range
+INTRANET="192.168.0.0/24"
+
+# Internet server official and VPN IPs
+SERVER_OFFICIAL="1.2.3.4"
+SERVER_INET="5.6.7.8/32"
+
+# Some port definitions
+DNS_PORT="53"
+WG_PORT="51820"
+
+SPAMHAUS_SET_V4="spamhaus_drop"
+SPAMHAUS_SET_V6="spamhaus_drop_v6"
+GEOIP_SET="geoip_country"
+
+C '========================================================'
+C 'Ruleset for a  dual-homed firewall and  VPN concentrator'
+C '========================================================'
+
+CC 'Filter table with Default DROP-Policies for INPUT and FORWARD chains'
+TABLE filter INPUT DROP FORWARD DROP OUTPUT ACCEPT
+
+CC 'Permit loopback traffic'
+IN -i lo
+
+CC 'Spamhaus DROPlist using ipset'
+BLOCKLIST4 "$SPAMHAUS_SET_V4"
+BLOCKLIST6 "$SPAMHAUS_SET_V6"
+
+CC 'ICMP Base & Rate-Limiting'
+C 'Essential ICMPv6 types (NDP, Path MTU)'
+ICMP6 router-advertisement
+ICMP6 neighbor-solicitation
+ICMP6 neighbor-advertisement
+ICMP6 destination-unreachable
+ICMP6 packet-too-big
+ICMP6 time-exceeded
+ICMP6 parameter-problem
+
+C 'Echo-request rate limiting (symmetric for v4 + v6)'
+ICMP echo-request `LIMIT 1 5`
+C 'DROP all remaining ICMP echo-requests'
+IN4 DROP -p icmp --icmp-type echo-request
+IN6 DROP -p icmpv6 --icmpv6-type echo-request
+
+C 'Allow ICMP globally for remaining ICMP types like dest-unreach etc.)'
+IN4 -p icmp
+IN6 -p icmpv6
+
+CC 'Trusted local LAN-traffic on intranet interface'
+IN -i "$INT_IF"
+
+CC 'WireGuard VPN handshake port (UDP) on external interface'
+UDP "$EXT_IF" "$WG_PORT"
+
+CC 'Access from VPN-Clients to local firewall services (e.g. DNS)'
+UDP "$VPN_IF" "$DNS_PORT"
+TCP "$VPN_IF" "$DNS_PORT"
+
+CC 'Stateful inspection for established connections'
+IN  `ESTABLISHED`
+FWD `ESTABLISHED`
+
+CC 'Forwarding rules between zones (LAN, VPN, WAN)'
+C 'Permit intranet (LAN eth0) to internet (WAN eth1)'
+FWD -i "$INT_IF" -o "$EXT_IF"
+
+C 'Permit intranet (LAN eth0) to WireGuard VPN (wg0)'
+FWD -i "$INT_IF" -o "$VPN_IF"
+
+C 'Deny Wireguard VPN (wg0) via INET-server to intranet (with ICMP exceptions)'
+FWD4 -i "$VPN_IF" -o "$INT_IF" -s "$SERVER_INET" -p icmp
+FWD4 DROP -i "$VPN_IF" -o "$INT_IF" -s "$SERVER_INET" `STATE NEW`
+
+C 'Remaining VPN clients allowed into intranet'
+FWD -i "$VPN_IF" -o "$INT_IF"
+
+C 'WireGuard VPN (wg0) allowed into internet (full-tunnel roaming via eth1)'
+FWD -i "$VPN_IF" -o "$EXT_IF"
+
+######################################################################
+#
+# Mangle-Table for MSS-clamping to avoid MTU problems
+#
+CC 'Mangle Table (MSS-clamping against MTU problems)'
+TABLE mangle
+
+# NOTE! Accept Wireguard traffic explicitely bevor marking packets, to avoid
+# double-marking of encrypted traffic (and thus avoid routing loops)!
+OUTPUT -p udp --dport 51820
+OUTPUT -p udp --sport 51820
+
+C 'Permit direct access to the internet server without GeoIP-based routing'
+R4 PREROUTING ACCEPT -d "$SERVER_OFFICIAL"
+R4 OUTPUT ACCEPT -d "$SERVER_OFFICIAL"
+
+C 'GeoIP-based routing for country domains (mark packets with mark 100)'
+R4 PREROUTING "`TARGET MARK 100`" `MATCHSET "$GEOIP_SET" dst`
+R4 OUTPUT "`TARGET MARK 100`" `MATCHSET "$GEOIP_SET" dst`
+
+CC 'TCP MSS-clamping for WAN and WireGuard networks'
+POSTROUTING "`TARGET TCPMSS`" -o "$EXT_IF" `TCPFLAGS SYN,RST SYN`
+R FORWARD "`TARGET TCPMSS`" -o "$VPN_IF" `TCPFLAGS SYN,RST SYN`
+
+########################################################################
+#
+# NAT-Table with associated rules
+#
+CC 'NAT table (masquerading for outbound traffic)'
+TABLE nat
+
+CC 'NAT / Masquerading for LAN and VPN to internet via WAN (eth1)'
+MASQUERADE -o "$EXT_IF"
+MASQUERADE -o "$VPN_IF" ! -s "$INTRANET"

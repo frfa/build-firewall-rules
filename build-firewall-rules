@@ -1,0 +1,626 @@
+#!/bin/sh
+program="${0##*/}"
+
+# H1 `build-firewall-rules` - create iptables IPv4 and IPv6 rules from template
+# MD This script uses `/etc/iptables/rules.template` as input to generate valid
+# `/etc/iptables/rules.v4` for IPv4, and `/etc/iptables/rules.v6` iptables
+# filter rule files, that can be loaded via `iptables-restore
+# </etc/iptables/rules.v4` and `ip6tables-restore </etc/iptables/rules.v6`
+# respectively.
+# > NOTE: Install `iptables-persistent` to load those filter-rules automatically
+# at startup.
+
+# --- Standard-Optionen ---
+TEMPLATE="/etc/iptables/rules.template"
+
+# vars
+d= v= q= n=
+
+# funcs
+[ -t 2 ] && black='\033[30m' red='\033[31m' green='\033[32m' yellow='\033[33m' blue='\033[34m' magenta='\033[35m' cyan='\033[36m' white='\033[37m' dflt='\033[39m'
+#msg() { [ "$q" ] || echo `date +"%Y-%m-%d %T"` $program "$@" >&2; }
+#msg() { [ "$q" ] || echo $program "$@" >&2; }
+msg() { echo "$@" >&2; } # generic messages are always issued
+dbg() { [ "$d" ] && msg "${white}D $*$dflt"; } # debug messages on -d
+dbgx() { [ "$d" ] && { echo -n "$white"; "$@"; echo -n "$dflt";} }
+ntc() { [ "$q" ] || msg "${green}N $*$dflt"; } # notices always except on -q
+inf() { [ "$v" ] && msg "${cyan}I $*$dflt"; } # informationals only on -v
+wrn() { [ "$q" ] || msg "${yellow}W $*$dflt"; } # warnings always except on -q
+err() { msg "${red}E $*$dflt"; } # errors are issued always
+syserr() { msg "${red}E $*: `expl \\\$!=$?`$dflt"; } # system errors as well
+ftl() { msg "${red}F $* ($?)$dflt"; exit 1; } # fatals exit
+sysftl() { msg "${red}F $*: `expl \\\$!=$?`$dflt"; exit 1; } # system fatals
+exe() { [ "$n" ] && msg "$*" || { dbg "$*"; "$@"; }; } # executions except -n
+# helpers
+expl() { perl -e "print $*"; }
+contains() { expr "$1" : ".*[$2]" >/dev/null; }
+# predicates für Chains ^[A-Z], Interfaces ^[a-z] und Options ^-
+ischain() { expr "$1" : '^[A-Z]' >/dev/null; }
+isif() { expr "$1" : '^[a-z]' >/dev/null; }
+isopt() { expr "$1" : '^-' >/dev/null; }
+
+# H2 Usage
+# MD build-firewall-rules is called as follows:
+# CODE
+# build-firewall-rules [OPTIONS] [TEMPLATE_FILE]
+# ENDCODE
+# MD If the rules `TEMPLATE_FILE` is not provided, the default rules template
+# file `/etc/iptables/rules.template` is assumed.
+# MD The following options may be used on invocation:
+usage() {
+    # OPTIONS
+    cat <<EOF
+Usage: $program [OPTIONS] [TEMPLATE_FILE]
+
+Generates synchronized /etc/iptables/rules.v4 and /etc/iptables/rules.v6
+from a single rules template file.
+
+Options:
+  -v, --verbose  Print verbose log information to standard error
+  -n, --noexec   Generates and validates rules, but does not overwrite any files
+  -q, --quiet    Suppresses normal log output, only errors will be displayed
+  -h, --help     Shows this help text
+  -l, --live     Immediately activates generated rules after successful validation
+
+Default TEMPLATE_FILE: $TEMPLATE
+EOF
+    # OPTEND
+    exit 0
+}
+# > NOTE: Using the `-n, --noexec` and the `-l, --live` options at the same time
+# will reload the existing firewall rules `/etc/iptables/rules.v4` and
+# `/etc/iptables/rules.v6`, as only temporary files will be generated and
+# validated. Recommended usage is therefore to test new iptables rules with
+# `build-firewall-rules -n`, followed by a `build-firewall-rules -l` after
+# successful validation.
+
+# Use sudo unless root
+[ "$(id -u)" != 0 ] && {
+    wrn "root privileges required, re-starting with sudo ..."
+    exec sudo "$0" "$@"
+}
+
+# Setze HOSTNAME, wenn nicht gesetzt
+[ "$HOSTNAME" ] || HOSTNAME=`hostname`
+
+# --- POSIX Parameter Parsing ---
+while :; do
+    case "$1" in
+	# generic options
+        -d|--debug) d=-d v=-v q=;;
+        -dd|--moredebug) d=-d v=-v q=; set -xv;;
+        -v|--verbose) v=-v q=;;
+        -q|--quiet) q=-q v=;;
+        -n|--noexec) n=-n;;
+	-h|--help) usage;;
+        # specific options go here
+        -l|--live) l="$1";;
+	-*) wrn "Unknown option $1 ignored";;
+	*) break;;
+    esac
+    shift
+done
+generic_opts="$d $v $q"
+#[ $# -lt 1 ] && ftl 'No arguments provided'
+
+# optional first arg: template file
+[ "$1" ] && TEMPLATE="$1"
+TARGET_DIR=$(dirname "$TEMPLATE")
+
+if [ "$n" ]; then
+    inf "DRY-RUN mode - temporary rule files used"
+    V4_OUT=$(mktemp)
+    V6_OUT=$(mktemp)
+    trap 'rm -f "$V4_OUT" "$V6_OUT"' EXIT
+else
+    V4_OUT="$TARGET_DIR/rules.v4"
+    V6_OUT="$TARGET_DIR/rules.v6"
+fi
+
+# =========================================================
+# DSL API-Kapselung (Schreibt in File-Deskriptoren FD 3 & 4)
+# =========================================================
+
+# H1 Syntax of the rules template file `/etc/iptables/rules.template`
+#
+# MD The rules template file is processed like any other shell script, so
+# employs POSIX-shell syntax. However, lots of useful shell functions for
+# firewall rule generation are predefined and form a kind of DSL
+# (Domain-Specific Language) to define a customized set of IPv4 and IPv6 rules.
+# MD Most of the DSL commands may be used with a "4" or "6" suffix to indicate
+# the corresponding rules should be generated for the IPv4 rules file
+# `/etc/iptables/rules.v4` or the IPv6 rules file `/etc/iptables/rules.v5`
+# respectively only.
+
+# H2 Comments
+# MD For example, comments in the `rules.template` file may be transliterated to
+# either both the `rules.v4` and `rules.v6` files only, when using the `CC` or
+# `C` DSL commands, while `C4` or `CC4` will transliterate the comment to the
+# `rules.v4` file only, and `C6` or `CC6` to the `rules.v6` file only.
+# MD Examples:
+# CODE
+# C 'This comment will appear both in the rules.v4 and rules.v6 file'
+# C4 'This comment will appear in the rules.v4 file only'
+# C6 'This comment will appear in the rules.v6 file only'
+# ENDCODE
+
+# MD The difference between the 'C' and 'CC' variants is, that 'CC' will emit an
+#additional newline "`\n`" before the comment line, which enables structurizing
+#the generated rulesets and make if more human-readable.
+
+# > NOTE: Including a pure shell comment line starting with a hash sign "`#`" in
+#the rule template is possible, but will **not** transliterate the comment to
+#either ruleset!
+
+### Kommentare/Remarks (schreibt "# ..." in v4 und v6)
+# F A comment, transliterated both to v4 and v6 rulesets.
+# I String The comment to transliterate.
+C() {
+    dbg "Comment: $*"
+    echo "# $*" >&3
+    echo "# $*" >&4
+}
+# F A comment, transliterated onyl to the v4 ruleset.
+# I String The comment to transliterate.
+C4() { dbg "v4-Comment: $*"; echo "# $*" >&3; }
+# F A comment, transliterated onyl to the v6 ruleset.
+# I String The comment to transliterate.
+C6() { dbg "v6-Comment: $*"; echo "# $*" >&4; }
+# F A comment preceded by a newline, transliterated to both v4 and v6 rulesets.
+# I String The comment to transliterate.
+CC() { echo >&3; echo >&4; C "$@"; }
+# F A comment preceded by a newline, transliterated to only the v4 ruleset.
+# I String The comment to transliterate.
+CC4() { echo >&3; C4 "$@"; }
+# F A comment preceded by a newline, transliterated to only the v6 ruleset.
+# I String The comment to transliterate.
+CC6() { echo >&4; C6 "$@"; }
+
+# Tabellen-Wechsel (Schließt vorherige Tabelle ab und öffnet neue)
+# H2 Table management
+# MD A new table is started with the `TABLE` command, followed by the table name
+# (e.v. `filter`, `mangle`, `nat`, etc.), and followed by pairs of chain name
+# and default policy for the chain for the chains in the table.
+table=
+# F Starts a new table. If the table name is `filter` not followed by any
+# chain-policy pairs, the default setup will be `INPUT DROP FORWRD DROP OUTPUT
+# ACCEPT`, meaning the default policy for the `INPUT` and `FORWARD` chains will
+# be set to `DROP`, and the default policy for the `OUTPUT`chain will be
+# `ACCEPT` -- a typical default firewall setup. A preceding `TABLE` will
+# automatically be `COMMIT`ted, if applicable.
+# I name The table name
+# I chain The chain name
+# I policy The default policy for the chain
+# - ... More chain-policy pairs
+# EX `TABLE filter`, same as
+# `TABLE filter INPUT DROP FORWARD DROP OUTPUT ACCEPT` <br>
+# You can also add other chain-policy pairs as necessary, e.g `DOCKER-USER -`,
+# indicating a Docker user chain without a default policy, as this chain is
+# managed by the Docker daemon.
+TABLE() { # table-name [CHAIN POLICY ...]
+    [ "$table" ] && { rule "COMMIT"; table=; }
+    table="$1"; shift
+    C "Changing table: $table"
+    rule "*$table"
+    # setup default filter chains for a firewall if none specified
+    [ "$table" = "filter" -a -z "$*" ] &&\
+        set -- INPUT DROP FORWARD DROP OUTPUT ACCEPT
+    while [ "$1" ]; do
+        chain="$1" policy="$2"; shift 2
+        rule ":$chain $policy [0:0]"
+    done
+}
+
+### Generische Regeln für IPv4 + IPv6 mit Debug-Ausgabe
+# H2 Generic DSL commands
+# MD Generic commands allow to construct any arbitrary iptables rule, as they
+# pass their arguments as-is to the v4 and/or v6 result rulesets. This means,
+# you have to use the exact same syntax for the arguments as for the iptables(8)
+# command. You'll hardly use them, as the whole purpose of the DSL is to make
+# life easier than hardcoding iptables rules.
+#
+# F Generic rule for both v4 and v6 rulesets.
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+# EX `rule -A INPUT -i eth0 -j ACCEPT`
+rule() { dbg "v4+v6 $*"; echo "$@" >&3; echo "$@" >&4; }
+# F Generic rule for v4 ruleset only.
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+rule4() { dbg "v4 $*"; echo "$@" >&3; }
+# F Generic rule for v6 ruleset only.
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+rule6() { dbg "v6 $*"; echo "$@" >&4; }
+chain() { rule -A "$@"; }
+chain4() { rule4 -A "$@"; }
+chain6() { rule6 -A "$@"; }
+# 2 fixe Argumente - append-chain, target-chain
+# F Generic rule with fixed chain and optional jump target arguments, v4+v6. The
+# jump target argument may be omitted, and defaults to `ACCEPT`. This will
+# probbaly be the most-used DSL command in a `rules.template`, as for a typical
+# firewall ruleset the default policy is `DROP`, and the rules then typically
+# `ACCEPT` some specific traffic.
+# I chain The chain this rule is appended to (`-A chain`)
+# I target The jump target for this rule (`-j target`)
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+# EX `R INPUT ACCEPT -i lo`
+# same as: `R INPUT -i lo`<br>
+# both translate to `-A INPUT -i lo -j ACCEPT` in the rulesets.
+R() { chn="$1" tgt=ACCEPT; shift; ischain "$1" && { tgt="$1"; shift; }
+      rule "${chn:+-A $chn}" "$@" "${tgt:+-j $tgt}"; }
+# F Generic rule with fixed chain and jump target arguments, v4 only.
+# I chain The chain this rule is appended to (`-A chain`)
+# I target The jump target for this rule (`-j target`)
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+R4() { chn="$1" tgt=ACCEPT; shift; ischain "$1" && { tgt="$1"; shift; }
+       rule4 "${chn:+-A $chn}" "$@" "${tgt:+-j $tgt}"; }
+# F Generic rule with fixed chain and jump target arguments, v6 only.
+# I chain The chain this rule is appended to (`-A chain`)
+# I target The jump target for this rule (`-j target`)
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+R6() { chn="$1" tgt=ACCEPT; shift; ischain "$1" && { tgt="$1"; shift; }
+       rule6 "${chn:+-A $chn}" "$@" "${tgt:+-j $tgt}"; }
+
+### Spezifische DSL
+### Jump-Target Shortcuts; ein mandatory append chain Argument
+# H2 Target-focused DSL functions
+# F Accept rule, for both v4 and v6 rulesets.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+ACCEPT() { local ch="$1"; shift; R "$ch" ACCEPT "$@"; }
+# F Accept rule, for v4 rulesets only.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+ACCEPT4() { local ch="$1"; shift; R4 "$ch" ACCEPT "$@"; }
+# F Accept rule, for v6 ruleset only.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+ACCEPT6() { local ch="$1"; shift; R6 "$ch" ACCEPT "$@"; }
+# F Same as `ACCEPT()` function.
+ACC()   { local ch="$1"; shift; R "$ch" ACCEPT "$@"; }
+# F Same as `ACCEPT4()` function.
+ACC4()  { local ch="$1"; shift; R4 "$ch" ACCEPT "$@"; }
+# F Same as `ACCEPT6()` function.
+ACC6()  { local ch="$1"; shift; R6 "$ch" ACCEPT "$@"; }
+# F Drop rule, for both v4 and v6 rulesets.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+DROP()  { local ch="$1"; shift; R "$ch" DROP "$@"; }
+# F Drop rule, for v4 ruleset only.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+DROP4() { local ch="$1"; shift; R4 "$ch" DROP "$@"; }
+# F Drop rule, for v6 ruleset only.
+# I chain The chain name of the chain the rule is appended to
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+DROP6() { local ch="$1"; shift; R6 "$ch" DROP "$@"; }
+### Default-Chain-Shortcuts ein opt. jump target chain Argument (default ACCEPT)
+# H2 Chain-focused DSL functions
+# F Input chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+INPUT() { R INPUT "$@"; }
+# F Same as `INPUT()` function.
+IN()   { R INPUT "$@"; }
+# F Input chain rule, for v4 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+IN4()  { R4 INPUT "$@"; }
+# F Input chain rule, for v6 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+IN6()  { R6 INPUT "$@"; }
+# F Forward chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+FORWARD() { R FORWARD "$@"; }
+# F Same as `FORWARD()` function
+FWD()  { R FORWARD "$@"; }
+# F Forward chain rule, for v4 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+FWD4() { R4 FORWARD "$@"; }
+# F Forward chain rule, for v6 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+FWD6() { R6 FORWARD "$@"; }
+# F Output chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+OUTPUT() { R OUTPUT "$@"; }
+# F Same as `OUTPUT()` function.
+OUT()  { R OUTPUT "$@"; }
+# F Output chain rule, for v4 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+OUT4() { R4 OUTPUT "$@"; }
+# F Output chain rule, for v4 ruleset only.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+OUT6() { R6 OUTPUT "$@"; }
+# Weitere Chain-Shortcuts
+# F Docker chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+DOCKER()     { R DOCKER "$@"; }
+# F Docker-User chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+DOCKER_USER() { R DOCKER-USER "$@"; }
+# F Prerouting chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+PREROUTING() { R PREROUTING "$@"; }
+# F Postrouting chain rule, for both v4 and v6 rulesets.
+# I Optional jump target chain, defaults to `ACCEPT`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+POSTROUTING(){ R POSTROUTING "$@"; }
+
+### Protokollspezifische Regeln
+# H2 Protocol-specific DSL functions
+# H3 ICMP input DSL functions
+# F ICMP type function, for both v4 and v6 rulesets.
+# I icmp-type ICMP accept type this rule applies to, e.g. `echo-request`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+# EX `ICMP echo-request 'LIMIT 1 5'`
+# _Defines a rate-limited rule to allow pings. See below for the `LIMIT` in-rule
+# helper function._ <br>
+# `ICMP DROP echo-request` <br>
+# _Denies ICMP echo requests._
+ICMP()  { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+          IN4 "$tgt" -p icmp --icmp-type "$@"
+          IN6 "$tgt" -p icmpv6 --icmpv6-type "$@"; }
+# F ICMP type function, for v4 ruleset only.
+# I icmp-type ICMP accept type this rule applies to, e.g. `echo-request`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+ICMP4() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+          IN4 "$tgt" -p icmp --icmp-type "$@"; }
+# F ICMP type function, for v6 ruleset only.
+# I icmp-type ICMP accept type this rule applies to, e.g. `echo-request`
+# I iptables-args Same argument syntax as for iptables(8) command arguments
+ICMP6() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+          IN6 "$tgt" -p icmpv6 --icmpv6-type "$@"; }
+# TCP
+# H3 TCP input DSL functions
+# F TCP traffic on a certain interface and specific port(s), both v4 and v6.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where TCP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+# EX `TCP eth0 22`
+# _Allow SSH input on the `eth0` interface._ <br>
+# `TCP DROP eth1 80,443` <br>
+# _Deny HTTP(S) traffic on the `eth1` interface._ <br>
+# `TCP enp4s0 0-1023`
+# _Allow all well-known ports for TCP on the `enp4s0` interface._
+TCP() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+        local IF="$1" PORTS="$2"
+        contains "$PORTS" ',' &&\
+            IN "$tgt" -i "$IF" -p tcp -m multiport --dports "$PORTS" ||\
+                IN "$tgt" -i "$IF" -p tcp --dport "$PORTS"; }
+# F TCP traffic on a certain interface and specific port(s), v4 only.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where TCP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+TCP4() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+         local IF="$1" PORTS="$2"
+         contains "$PORTS" ',' &&\
+             IN4 "$tgt" -i "$IF" -p tcp -m multiport --dports "$PORTS" ||\
+                 IN4 "$tgt" -i "$IF" -p tcp --dport "$PORTS"; }
+# F TCP traffic on a certain interface and specific port(s), v6 only.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where TCP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+TCP6() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+         local IF="$1" PORTS="$2"
+         contains "$PORTS" ',' &&\
+             IN6 "$tgt" -i "$IF" -p tcp -m multiport --dports "$PORTS" ||\
+                 IN6 "$tgt" -i "$IF" -p tcp --dport "$PORTS"; }
+# UDP
+# H3 UDP input DSL functions
+# F UDP traffic on a certain interface and specific port(s), both v4 and v6.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where UDP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+# EX `UDP eth0 53`
+# _Allow DNS input on the `eth0` interface._ <br>
+# `UDP DROP eth1 137,138` <br>
+# _Deny NETBIOS traffic on the `eth1` interface._ <br>
+# `UDP enp4s0 0-1023`
+# _Allow all well-known ports for UDP on the `enp4s0` interface._
+UDP() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+        local IF="$1" PORTS="$2"
+        contains "$PORTS" ',' &&\
+            IN "$tgt"-i "$IF" -p udp -m multiport --dports "$PORTS" ||\
+                IN "$tgt" -i "$IF" -p udp --dport "$PORTS"; }
+# F UDP traffic on a certain interface and specific port(s), v4 only.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where UDP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+UDP4() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+         local IF="$1" PORTS="$2"
+         contains "$PORTS" ',' &&\
+             IN4 "$tgt" -i "$IF" -p udp -m multiport --dports "$PORTS" ||\
+                 IN4 "$tgt" -i "$IF" -p udp --dport "$PORTS"; }
+# F UDP traffic on a certain interface and specific port(s), v6 only.
+# I target Optional jump target chain, defaults to `ACCEPT`
+# I interface The interface where UDP traffic should be handled
+# I port(s) Port specification, single, multiple comma-separated, or port range
+UDP6() { local tgt=ACCEPT; ischain "$1" && { tgt="$1"; shift; }
+         local IF="$1" PORTS="$2"
+         contains "$PORTS" ',' &&\
+             IN6 "$tgt"-i "$IF" -p udp -m multiport --dports "$PORTS" ||\
+                 IN6 "$tgt" -i "$IF" -p udp --dport "$PORTS"; }
+
+# in-rule helpers (use backtick notation) e.g. IN `ESTABLISHED`
+# H2 In-Rule helper functions
+# MD These functions are not to be used as DSL rule commands; rather they are
+# designed to be used within a rule definition using the backtick \` or shell
+# command substitution `$(...)` syntax, as they expand to a list of arguments
+# for iptables(8). These helper functions make it easier to specify features
+# like ICMP types, conntrack state information, rate limiting, or TCP flags
+# within a rule.
+# F Inserts ICMP protocol and ICMP type within a rule.
+# I icmp-type The icmp-type to include
+# EX ``IN4 `ICMPTYPE echo-request` ``
+# Inserts the expansion `-p icmp --icmp-type echo-request` within the rule,
+# allowing ICMPv4 echo requests on input.
+ICMPTYPE() { echo -n "-p icmp --icmp-type $*"; }
+# F Inserts ICMPv6 protocol and ICMPv6 type within a rule.
+# I icmp-type the icmp-type to include
+# EX ``IN6 `ICMP6TYPE echo-request` ``
+# Inserts the expansion `-p icmpv6 --icmpv6-type echo-request` within the rule,
+# allowing ICMPv6 echo requests on input.
+ICMP6TYPE() { echo -n "-p icmpv6 --icmpv6-type $*"; }
+# F Inserts conntrack state matching within a rule.
+# I ctstate The conntrack states to be included
+# EX ``IN `STATE ESTABLISHED,RELATED` ``
+# Accepts already established connections connections on input.
+STATE() { echo -n "-m conntrack --ctstate $*"; }
+# F Inserts conntrack `ESTABLISHED,RELATED` information in the rule.
+# This is a shortcut for the `STATE ESTABLISHED,RELATED` example above.
+# EX ``IN `ESTABLISHED` `` -- same as above example.
+ESTABLISHED() { STATE "ESTABLISHED,RELATED"; }
+# F Inserts rate limiting within the rule
+# I limit The packets per second limit to include
+# I burst The burst packet limit to include
+# EX ``ICMP echo-request `LIMIT 1 5` ``
+# This allows rate-limited ping requests, with a limit of 1 packet per second,
+# and a burst rate of 5 packets per second. This is the default btw, so you may
+# use just ``ICMP echo-request `LIMIT` ``, which has the same effect.
+LIMIT() { echo -n "-m limit --limit ${1:-1}/s --limit-burst ${2:-5}"; }
+# F Insert TCP flag information within the rule
+# I check The set of flags to check against
+# I flags The flags that must be set for the expression to match
+# EX ``TCP eth0 22 `TCPFLAGS SYN,RST SYN` ``
+# Allows new SSH connections on input.
+TCPFLAGS() { echo -n "-p tcp --tcp-flags ${1:-SYN,RST} ${2:-SYN}"; }
+# F Matches a named `ipset` IP set for eitcher source (default) or destination
+# address.
+# I ipset-name Name of the IP set to match against
+# I src-dst Match against source (`src`, default) or destination (`dst`) addresses
+MATCHSET() { echo -n "-m set --match-set ${1:-spamhaus_drop} ${2:-src}"; }
+# F Target-specific helpers for MSS clamping, or packet marking.
+# I tgt Target specification: `TCPMSS`, or `MARK nnn`
+# EX `` POSTROUTING "`TARGET TCPMSS`" -o "$EXT_IF" `TCPFLAGS SYN,RST SYN` ``
+# Introduces MSS clamping for the `TCPMSS` target for new connections on the
+# external interface (using the `TCPFLAGS` in-rule helper). This results in the
+# rule `-A POSTROUTING -o eth1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS
+# --clamp-mss-to-pmtu` appended to the `/etc/iptables/rules.v4` file. <br>
+# `` R4 PREROUTING "`TARGET MARK 100`" `MATCHSET "$GEOIP_SET" dst` `` <br>
+# This marks packets that match against a certain IP set with mark 100 during
+# pre-routing.
+TARGET() {
+    case "$1" in
+        TCPMSS) echo -n "$1 --clamp-mss-to-pmtu";;
+        MARK)   echo -n "$1 --set-mark ${2:-100}";;
+        *)      echo -n "$*";;
+    esac
+}
+
+# Shortcuts, NAT / Port-Forwarding DSL-Erweiterungen
+# H2 Shortcuts for blocklists, NAT and port forwarding
+# F Blocks IPv4 source addresses on input and forward that match against a certain IP set.
+# I ipset Name of the IP set to match against
+# EX `BLOCKLIST4 "spamhaus_drop"`
+# Drop packets from IPv4 addresses contained in the Spamhaus DROP list.
+BLOCKLIST4() {
+    R4 INPUT DROP `MATCHSET "$1" src`
+    R4 FORWARD DROP `MATCHSET "$1" src`
+}
+# F Blocks IPv6 packets on input and forward that match against a certain IP set.
+# I ipset Name of the IP set to match against
+# EX `BLOCKLIST6 "spamhaus_drop_v6"`
+# Drop packets from IPv6 addresses contained in the Spamhaus IPv6 DROP list.
+BLOCKLIST6() {
+    R6 INPUT DROP `MATCHSET "$1" src`
+    R6 FORWARD DROP `MATCHSET "$1" src`
+}
+# F Establishes masquerading for IPv4 source addresses during post-routing. <br>
+# **Note**: This DSL function has to be used within the `TABLE nat` section!
+# EX `MASQUERADE -o "$EXT_IF"`
+# Establish source address masquerading on outgoing packets on the external
+# interface.
+MASQUERADE() { R4 POSTROUTING MASQUERADE "$@"; } # assumes TABLE nat!
+# F Establishes destination NAT (DNAT) for IPv4 destination addresses during
+# pre-routing. <br>
+# **Note**: This DSL function has to be used within the `TABLE nat` section!
+# EX `DNAT -o "$EXT_IF"` ! -s "$INTRANET"
+# Establish destination NAT on outgoing packets, but not for internal Intranet
+# addresses.
+DNAT()       { R4 PREROUTING DNAT "$@"; } # DNAT ist meist IPv4-spezifisch
+#MASQUERADE() { R4 POSTROUTING MASQUERADE -t nat "$@"; }
+#DNAT()       { R4 PREROUTING DNAT -t nat "$@"; } # DNAT ist meist IPv4-spezifisch
+
+######################################################################
+#
+# Main code logic starts here
+#
+######################################################################
+
+if [ ! -r "$TEMPLATE" ]; then
+    err "Template '$TEMPLATE' not found!"
+    exit 1
+fi
+
+inf "Processing rules template $TEMPLATE"
+
+[ "$n" ] || {
+    inf "Backing up existing rulesets"
+    [ -f "$V4_OUT" ] && cp "$V4_OUT" "$V4_OUT".bak
+    [ -f "$V6_OUT" ] && cp "$V6_OUT" "$V6_OUT".bak
+}
+
+# File-Deskriptoren öffnen: FD 3 -> rules.v4, FD 4 -> rules.v6
+exec 3>"$V4_OUT"
+exec 4>"$V6_OUT"
+
+# Filter-Header schreiben - passiert jetzt mit TABLE-Statement!
+#for fd in 3 4; do
+#    cat <<EOF >&$fd
+#*filter
+#:INPUT DROP [0:0]
+#:FORWARD DROP [0:0]
+#:OUTPUT ACCEPT [0:0]
+#:DOCKER - [0:0]
+#:DOCKER-USER - [0:0]
+#EOF
+#done
+
+# Template sourcen
+{ . "$TEMPLATE"; } 3>&3 4>&4
+
+# Footer schreiben
+[ "$table" ] && { echo "COMMIT" >&3; echo "COMMIT" >&4; table=; }
+
+# Deskriptoren schließen
+exec 3>&-
+exec 4>&-
+
+inf "Validating rule syntax with iptables-restore / ip6tables-restore ..."
+
+# Prüfen, ob ipset verfügbar ist und Dummy-Sets für den Test anlegen
+if command -v ipset >/dev/null 2>&1; then
+    ipset create "$SPAMHAUS_SET_V4" hash:net -exist 2>/dev/null || true
+    ipset create "$SPAMHAUS_SET_V6" hash:net family inet6 -exist 2>/dev/null || true
+    case "$HOSTNAME" in
+        drfasching)
+            ipset create "manual-blocklist" hash:net -exist 2>/dev/null || true;;
+        schroedingerscat)
+            ipset create "geoip_de" hash:net -exist 2>/dev/null || true;;
+    esac
+fi
+
+if iptables-restore --test < "$V4_OUT" && ip6tables-restore --test < "$V6_OUT"; then
+    if [ "$n" ]; then
+        inf "[SUCCESS] Syntax test passed! (Dry-run: No files have been changed)."
+    else
+        inf "[SUCCESS] $V4_OUT und $V6_OUT generated and validated."
+        [ "$l" ] && {
+            ntc "[LIVE] Activating IPv4 rules $V4_OUT now!"
+            iptables-restore <"$V4_OUT" || err "Error activating IPv4 rules!"
+            ntc "[LIVE] Activating IPv6 rules $V6_OUT now!"
+            ip6tables-restore <"$V6_OUT" || err "Error activating IPv6 rules!"
+        }
+    fi
+else
+    err "Syntax error during rule generation!"
+    exit 1
+fi
