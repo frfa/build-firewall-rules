@@ -1,10 +1,3 @@
-<style type="text/css">
-/* table { table-layout: fixed; } */
-table tbody tr td:nth-child(1) { vertical-align: top; }
-table tbody tr td:nth-child(2) { vertical-align: top; }
-</style>
-
-
 # `build-firewall-rules` - create iptables IPv4 and IPv6 rules from template
 
 

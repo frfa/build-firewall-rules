@@ -3,7 +3,7 @@
 This tool reads a template file with rules defined in a DSL (domain-specific
 language) that produces iptables filter rules suitable for loading via
 `iptables-restore`. For details about the syntax of this DSL see the file
-<build-firewall-rules.md>.
+[build-firewall-rules.md](build-firewall-rules.md).
 
 The default rules template file is `/etc/iptables/rules.template`, and the IPv4
 and IPv6 rules files are `/etc/iptables/rules.v4` and `/etc/iptables/rules.v6`
